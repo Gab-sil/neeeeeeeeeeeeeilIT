@@ -1,13 +1,13 @@
-#include <vector>
-
 #define ServoIn   18
 #define Emitter   19
 #define Receiver  20
+#define MAX_NIBBLES 64
 
 struct ir_packet_t {
-    std::vector<uint8_t> nibbles;
-    bool complete = false;
-    bool error    = false;
+    uint8_t  nibbles[MAX_NIBBLES];
+    uint8_t  count    = 0;
+    bool     complete = false;
+    bool     error    = false;
 };
 
 typedef enum {
@@ -17,7 +17,7 @@ typedef enum {
     STATE_MARK,
 } ir_rx_state_t;
 
-volatile ir_rx_state_t state = STATE_IDLE;
+volatile ir_rx_state_t state          = STATE_IDLE;
 volatile uint32_t      last_edge_time = 0;
 volatile bool          packet_ready   = false;
 
@@ -60,8 +60,17 @@ void on_edge() {
                     packet_ready = true;
                     state = STATE_IDLE;
                 } else if (elapsed >= 375) {
-                    uint8_t nibble = (elapsed - 500) / 300;
-                    packet.nibbles.push_back(nibble);
+                    if (packet.count < MAX_NIBBLES) {
+                      uint8_t nibble = (elapsed - 500) / 300;
+                      if (nibble > 0xE) {
+                          packet.error = true;
+                          state = STATE_IDLE;
+                          return;
+                      }
+                      packet.nibbles[packet.count++] = nibble;
+                    } else {
+                        packet.error = true;
+                    }
                     last_edge_time = now;
                     state = STATE_MARK;
                 } else {
@@ -98,7 +107,6 @@ void setup() {
 }
 
 void loop() {
-    // Check state transitions for serial printing (sampled safely outside ISR)
     static ir_rx_state_t last_state = STATE_IDLE;
     ir_rx_state_t current_state = state;
 
@@ -108,7 +116,6 @@ void loop() {
 
     last_state = current_state;
 
-    // Handle completed packet
     if (packet_ready) {
         noInterrupts();
         ir_packet_t p = ready_packet;
@@ -117,24 +124,25 @@ void loop() {
 
         Serial.println("[RX] Packet complete!");
         Serial.print("[RX] Nibble count: ");
-        Serial.println(p.nibbles.size());
+        Serial.println(p.count);
 
         if (p.error) {
             Serial.println("[RX] Warning: packet flagged error");
         }
 
-        Serial.print("[RX] Nibbles (hex): ");
-        for (auto n : p.nibbles) {
-            if (n < 16) Serial.print("0");
-            Serial.print(n, HEX);
+        Serial.print("[RX] Decoded bytes (hex): ");
+        for (int i = 0; i + 1 < p.count; i += 2) {
+            uint8_t byte_val = (p.nibbles[i] << 4) | p.nibbles[i + 1];
+            if (byte_val < 0x10) Serial.print("0");
+            Serial.print(byte_val, HEX);
             Serial.print(" ");
         }
         Serial.println();
 
-        Serial.print("[RX] Nibbles (dec): ");
-        for (auto n : p.nibbles) {
-            Serial.print(n, DEC);
-            Serial.print(" ");
+        Serial.print("[RX] Decoded string: ");
+        for (int i = 0; i + 1 < p.count; i += 2) {
+            uint8_t byte_val = (p.nibbles[i] << 4) | p.nibbles[i + 1];
+            Serial.print((char)byte_val);
         }
         Serial.println();
     }
