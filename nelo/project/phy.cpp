@@ -1,21 +1,26 @@
 #include "phy.h"
 
+// ── PIO RX state ──────────────────────────────────────────────
+static PIO  _pio       = pio0;
+static uint _sm        = 0;
+
+// ── TX state ──────────────────────────────────────────────────
+static uint8_t _tx_slice;
+static bool    _transmitting = false;
+
+// ── Packet state ──────────────────────────────────────────────
+static ir_packet_t _packet;
+static ir_packet_t _ready_packet;
+static bool        _packet_ready = false;
+static uint32_t    _last_fifo_time = 0;  // for stop silence detection
+
 typedef enum {
     STATE_IDLE,
-    STATE_START_MARK,
     STATE_GAP,
     STATE_MARK,
 } ir_rx_state_t;
 
-static volatile ir_rx_state_t _state          = STATE_IDLE;
-static volatile uint32_t      _last_edge_time = 0;
-static volatile bool          _packet_ready   = false;
-
-static ir_packet_t _packet;
-static ir_packet_t _ready_packet;
-
-static uint8_t  _tx_slice;
-static bool     _transmitting = false;
+static ir_rx_state_t _state = STATE_IDLE;
 
 // ── TX helpers ────────────────────────────────────────────────
 static void _ir_on()  { pwm_set_enabled(_tx_slice, true);  }
@@ -31,87 +36,76 @@ static void _gap(uint32_t us) {
     delayMicroseconds(us);
 }
 
-// ── ISR ───────────────────────────────────────────────────────
-static void _on_edge() {
-    bool pin     = digitalRead(RECEIVER_PIN);
-    uint32_t now = micros();
-    uint32_t elapsed = now - _last_edge_time;
+// ── PIO RX FIFO processing ────────────────────────────────────
+static void _process_fifo() {
+    while (!pio_sm_is_rx_fifo_empty(_pio, _sm)) {
+        uint32_t word        = pio_sm_get(_pio, _sm);
+        bool     is_gap      = (word >> 31) & 1;
+        uint32_t duration_us = word & 0x7FFFFFFF;
 
-    bool falling = (pin == LOW);
-    bool rising  = (pin == HIGH);
+        _last_fifo_time = micros();  // update last activity timestamp
 
-    if (_transmitting) return;  // crosstalk guard
-
-    switch (_state) {
-        case STATE_IDLE:
-            if (falling) {
-                _last_edge_time = now;
-                _state = STATE_START_MARK;
-            }
-            break;
-
-        case STATE_START_MARK:
-            if (rising) {
-                if (elapsed >= 750 && elapsed <= 1250) {
-                    _packet = ir_packet_t{};
-                    _last_edge_time = now;
+        if (!is_gap) {
+            // MARK received
+            if (duration_us >= 750 && duration_us <= 1250) {
+                // valid start mark
+                _packet  = ir_packet_t{};
+                _state   = STATE_GAP;
+            } else if (_state == STATE_MARK) {
+                if (duration_us >= 375 && duration_us <= 625) {
                     _state = STATE_GAP;
                 } else {
+                    _packet.error = true;
                     _state = STATE_IDLE;
                 }
+            } else {
+                _state = STATE_IDLE;
             }
-            break;
+        } else {
+            // GAP received
+            if (_state != STATE_GAP) {
+                _state = STATE_IDLE;
+                return;
+            }
 
-        case STATE_GAP:
-            if (falling) {
-                if (elapsed >= 375) {
-                    if (_packet.count < MAX_NIBBLES) {
-                        uint8_t nibble = (elapsed - GAP_BASE_US + GAP_STEP_US / 2) / GAP_STEP_US;
-                        if (nibble > 0xF) {
-                            _packet.error = true;
-                            _state = STATE_IDLE;
-                            return;
-                        }
-                        _packet.nibbles[_packet.count++] = nibble;
-                    } else {
-                        _packet.error = true;
-                    }
-                    _last_edge_time = now;
+            if (duration_us >= 375) {
+                // rounding: add half a step before dividing
+                uint8_t nibble = (duration_us - GAP_BASE_US + GAP_STEP_US / 2) / GAP_STEP_US;
+                if (nibble > 0xE) {
+                    _packet.error = true;
+                    _state = STATE_IDLE;
+                    return;
+                }
+                if (_packet.count < MAX_NIBBLES) {
+                    _packet.nibbles[_packet.count++] = nibble;
                     _state = STATE_MARK;
                 } else {
                     _packet.error = true;
                     _state = STATE_IDLE;
                 }
+            } else {
+                _packet.error = true;
+                _state = STATE_IDLE;
             }
-            break;
-
-        case STATE_MARK:
-            if (rising) {
-                if (elapsed >= 375 && elapsed <= 625) {
-                    _last_edge_time = now;
-                    _state = STATE_GAP;
-                } else {
-                    _packet.error = true;
-                    _state = STATE_IDLE;
-                }
-            }
-            break;
+        }
     }
 }
 
 // ── public API ────────────────────────────────────────────────
 void phy_init() {
-    pinMode(RECEIVER_PIN, INPUT);
+    // RX — PIO
+    uint offset = pio_add_program(_pio, &ir_rx_program);
+    ir_rx_program_init(_pio, _sm, offset, RECEIVER_PIN, 1000000.0f);
 
+    // TX — PWM at 38kHz
+    // wrap = clk / freq - 1 = 125,000,000 / 38,000 - 1 ≈ 3289
+    pinMode(SERVO_PIN, OUTPUT);
     gpio_set_function(EMITTER_PIN, GPIO_FUNC_PWM);
     _tx_slice = pwm_gpio_to_slice_num(EMITTER_PIN);
     pwm_set_wrap(_tx_slice, 3289);
     pwm_set_clkdiv(_tx_slice, 1.0f);
-    pwm_set_gpio_level(EMITTER_PIN, 3289 / 2);
+    pwm_set_gpio_level(EMITTER_PIN, 3289 / 2);  // 50% duty cycle
     pwm_set_enabled(_tx_slice, false);
-
-    attachInterrupt(digitalPinToInterrupt(RECEIVER_PIN), _on_edge, CHANGE);
-
 }
 
 void phy_send_nibble(uint8_t nibble) {
@@ -121,31 +115,44 @@ void phy_send_nibble(uint8_t nibble) {
 
 void phy_send_byte(uint8_t b) {
     phy_send_nibble((b >> 4) & 0x0F);
-    phy_send_nibble(b & 0x0F);
+    phy_send_nibble( b       & 0x0F);
 }
 
 void phy_send_raw(const uint8_t *bytes, uint8_t len) {
     _transmitting = true;
-    noInterrupts();
+
+    // disable PIO SM during TX to avoid reading our own signal
+    pio_sm_set_enabled(_pio, _sm, false);
+    // drain any stale FIFO values
+    while (!pio_sm_is_rx_fifo_empty(_pio, _sm))
+        pio_sm_get(_pio, _sm);
 
     _mark(START_MARK_US);
     for (uint8_t i = 0; i < len; i++)
         phy_send_byte(bytes[i]);
 
-    interrupts();
+    // stop silence — just wait
+    _gap(STOP_US + 1000);
+
+    // re-enable PIO RX
+    pio_sm_set_enabled(_pio, _sm, true);
     _transmitting = false;
+    _state = STATE_IDLE;
 }
 
-// chama no loop — deteção de stop silence sem depender de edge
 void phy_update() {
-    if (_state == STATE_GAP || _state == STATE_MARK) {
-        if (micros() - _last_edge_time > STOP_US) {
+    if (_transmitting) return;
+
+    _process_fifo();
+
+    // stop silence detection — if we haven't seen a FIFO word in a while
+    // and we're mid-packet, finalize it
+    if (_state != STATE_IDLE) {
+        if (micros() - _last_fifo_time > STOP_US) {
             if (_packet.count > 0 && !_packet.error) {
                 _packet.complete = true;
-                noInterrupts();
                 _ready_packet = _packet;
                 _packet_ready = true;
-                interrupts();
             }
             _state = STATE_IDLE;
         }
@@ -154,9 +161,7 @@ void phy_update() {
 
 bool phy_packet_ready(ir_packet_t *out) {
     if (!_packet_ready) return false;
-    noInterrupts();
-    *out = _ready_packet;
+    *out          = _ready_packet;
     _packet_ready = false;
-    interrupts();
     return true;
 }

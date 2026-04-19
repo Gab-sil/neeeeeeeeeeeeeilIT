@@ -1,0 +1,58 @@
+;
+; ir_rx.pio
+; Measures MARK and GAP durations
+; Pushes 32-bit words to RX FIFO:
+;   bit 31 = 0 → MARK duration
+;   bit 31 = 1 → GAP duration
+;   bits 30:0  = duration in ticks (1 tick = 1µs at 1MHz)
+;
+
+.program ir_rx
+
+.wrap_target
+    ; wait for falling edge (MARK starts)
+    wait 1 pin 0
+    wait 0 pin 0
+
+    ; count LOW duration (MARK)
+    mov x, ~null            ; x = 0xFFFFFFFF
+low_loop:
+    jmp pin  mark_done      ; pin went HIGH, mark ended
+    jmp x--  low_loop       ; still LOW, keep counting
+mark_done:
+    mov isr, ~x             ; isr = elapsed ticks
+    push noblock            ; MSB naturally 0 = MARK
+
+    ; count HIGH duration (GAP)
+    mov x, ~null
+high_loop:
+    jmp pin  high_loop      ; still HIGH, keep counting
+    nop                     ; fell through = pin went LOW
+gap_done:
+    mov isr, ~x
+    in  pins, 1             ; shift in a 1 for MSB = GAP type
+    push noblock
+
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void ir_rx_program_init(PIO pio, uint sm, uint offset, uint pin, float freq) {
+    pio_sm_config c = ir_rx_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_jmp_pin(&c, pin);
+
+    float div = (float)clock_get_hz(clk_sys) / freq;
+    sm_config_set_clkdiv(&c, div);
+
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

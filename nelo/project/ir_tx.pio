@@ -1,0 +1,20 @@
+;
+; ir_tx.pio
+; Transmits IR pulses with 38kHz carrier
+; CPU writes duration in microseconds to TX FIFO
+; MSB=0 → MARK (carrier on), MSB=1 → GAP (silence)
+;
+
+.program ir_tx
+.side_set 1 opt
+
+.wrap_target
+    ; wait for a word from the FIFO
+    pull block              side 0  ; pull duration, carrier off while waiting
+
+    ; check MSB for type
+    mov x, osr                      ; copy to x
+    out null, 31                    ; discard top 31 bits into null... 
+    ; actually simpler: handle in two programs
+    ; see note below
+.wrap
