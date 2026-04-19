@@ -2,6 +2,15 @@
 
 static uint8_t _regs[64] = {0};
 
+typedef enum {
+    APP_IDLE,
+    APP_WAIT_PONG,
+} app_state_t;
+
+static app_state_t _app_state = APP_IDLE;
+static uint32_t    _deadline  = 0;
+static uint8_t     _ping_dest = 0;
+
 // ── handlers RX ──────────────────────────────────────────────
 static void _handle_ping(const ir_frame_t *f) {
     ir_frame_t pong;
@@ -85,14 +94,28 @@ static void _print_menu() {
 
 static uint8_t _ask_byte(const char *prompt) {
     Serial.print(prompt);
-    while (!Serial.available());
-    uint8_t val = (uint8_t)Serial.parseInt();
+    char buf[8] = {0};
+    uint8_t i = 0;
+    while (true) {
+        phy_update();          
+        if (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (i > 0) break;
+            } else if (i < sizeof(buf) - 1) {
+                buf[i++] = c;
+            }
+        }
+    }
+    uint8_t val = (uint8_t)atoi(buf);
     Serial.println(val);
     return val;
 }
 
 static void _do_ping() {
     uint8_t dest = _ask_byte("Endereço destino (dec): ");
+    uint8_t wait = _ask_byte("Aguardar PONG? (1/0): ");
+
     ir_frame_t f;
     f.address = dest;
     f.control = CMD_PING;
@@ -100,9 +123,22 @@ static void _do_ping() {
     dl_send(&f);
     Serial.print("[APP] PING enviado para 0x");
     Serial.println(dest, HEX);
-    dl_error_t err = dl_wait_ack(dest, ACK_TIMEOUT_MS);
-    Serial.print("[APP] Resposta: ");
-    Serial.println(dl_error_str(err));
+
+    if (wait) {
+        uint32_t deadline = millis() + ACK_TIMEOUT_MS;
+        while (millis() < deadline) {
+            phy_update();          // ← essencial aqui dentro
+            ir_frame_t resp;
+            if (dl_receive(&resp) == DL_OK) {
+                if (resp.control == CMD_PONG) {
+                    Serial.print("[APP] PONG recebido de 0x");
+                    Serial.println(resp.source, HEX);
+                    return;
+                }
+            }
+        }
+        Serial.println("[APP] Timeout — sem PONG");
+    }
 }
 
 static void _do_write() {
@@ -195,18 +231,46 @@ void app_update() {
     phy_update();
 
     ir_frame_t f;
-    if (dl_receive(&f) == DL_OK)
-        _process_frame(&f);
+    if (dl_receive(&f) == DL_OK) {
+        if (_app_state == APP_WAIT_PONG && f.control == CMD_PONG) {
+            Serial.print("[APP] PONG recebido de 0x");
+            Serial.println(f.source, HEX);
+            _app_state = APP_IDLE;
+        } else {
+            _process_frame(&f);
+        }
+    }
 
-    if (Serial.available()) {
+    if (_app_state == APP_WAIT_PONG && millis() > _deadline) {
+        Serial.println("[APP] Timeout — sem PONG");
+        _app_state = APP_IDLE;
+    }
+
+    if (_app_state == APP_IDLE && Serial.available()) {
         char c = Serial.read();
         switch (c) {
-            case '1': _do_ping();      break;
+            case '1': {
+                uint8_t dest = _ask_byte("Endereço destino (dec): ");
+                uint8_t wait = _ask_byte("Aguardar PONG? (1/0): ");
+                ir_frame_t ping;
+                ping.address = dest;
+                ping.control = CMD_PING;
+                ping.len     = 0;
+                dl_send(&ping);
+                Serial.print("[APP] PING enviado para 0x");
+                Serial.println(dest, HEX);
+                if (wait) {
+                    _ping_dest  = dest;
+                    _deadline   = millis() + ACK_TIMEOUT_MS;
+                    _app_state  = APP_WAIT_PONG;
+                }
+                break;
+            }
             case '2': _do_write();     break;
             case '3': _do_read();      break;
             case '4': _do_show_regs(); break;
             default: break;
         }
-        _print_menu();
+        if (_app_state == APP_IDLE) _print_menu();
     }
-} 
+}
