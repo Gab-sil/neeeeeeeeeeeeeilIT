@@ -82,7 +82,7 @@ static void _print_menu() {
     Serial.println("3 - READ registos");
     Serial.println("4 - Ver registos locais");
     Serial.println("5 - SWEEP (descobrir nós)");
-    Serial.println("6 - AUTO (ler fonte → escrever destino)");
+    Serial.println("6 - AUTO (fonte → destino)");
     Serial.println("7 - Ver tabela de nós");
     Serial.println("============");
 }
@@ -108,12 +108,10 @@ static uint8_t _ask_byte(const char *prompt) {
 }
 
 // ── helper: ler N registos de um nó remoto ───────────────────
-// Aponta o servo para o nó, envia CMD_READ, aguarda resposta.
-// Devolve true e preenche buf[] em caso de sucesso.
 static bool _remote_read(uint8_t node_addr, uint8_t start, uint8_t count, uint8_t *buf) {
     if (count == 0 || count > MAX_PAYLOAD - 2) return false;
 
-    sweep_point(node_addr);        // aponta servo
+    sweep_point(node_addr);
 
     ir_frame_t f;
     f.address    = node_addr;
@@ -127,11 +125,10 @@ static bool _remote_read(uint8_t node_addr, uint8_t start, uint8_t count, uint8_
     while (millis() < deadline) {
         phy_update();
         ir_frame_t resp;
-        if (dl_receive(&resp) != DL_OK) continue;
-        if (resp.source           != node_addr)  continue;
-        if ((resp.control & 0x7F) != CMD_READ)   continue;
-        if (resp.len              < 2 + count)   continue;
-
+        if (dl_receive(&resp) != DL_OK)              continue;
+        if (resp.source           != node_addr)      continue;
+        if ((resp.control & 0x7F) != CMD_READ)       continue;
+        if (resp.len              < 2 + count)       continue;
         memcpy(buf, &resp.payload[2], count);
         return true;
     }
@@ -145,7 +142,7 @@ static bool _remote_write(uint8_t node_addr, uint8_t start,
                            uint8_t count, const uint8_t *vals, bool with_ack) {
     if (count == 0 || count > MAX_PAYLOAD - 2) return false;
 
-    sweep_point(node_addr);        // aponta servo
+    sweep_point(node_addr);
 
     ir_frame_t f;
     f.address    = node_addr;
@@ -170,10 +167,7 @@ static bool _remote_write(uint8_t node_addr, uint8_t start,
 // ── acções do menu ────────────────────────────────────────────
 static void _do_ping() {
     uint8_t dest = _ask_byte("Endereço destino (dec): ");
-    uint8_t wait = _ask_byte("Aguardar PONG? (1/0): ");
-
-    if (sweep_get_count() > 0) sweep_point(dest);  // aponta se já fez sweep
-
+    if (sweep_get_count() > 0) sweep_point(dest);
     ir_frame_t f;
     f.address = dest;
     f.control = CMD_PING;
@@ -181,12 +175,6 @@ static void _do_ping() {
     dl_send(&f);
     Serial.print("[APP] PING enviado para 0x");
     Serial.println(dest, HEX);
-
-    if (wait) {
-        dl_error_t err = dl_wait_ack(dest, ACK_TIMEOUT_MS);
-        Serial.print("[APP] PONG: ");
-        Serial.println(dl_error_str(err));
-    }
 }
 
 static void _do_write() {
@@ -245,42 +233,38 @@ static void _do_show_regs() {
 }
 
 // ── modo autónomo ─────────────────────────────────────────────
-// Protocolo de registos (especificação da competição):
-//   reg[00] = endereço da torre de destino
-//   reg[01] = XX = start index para escrever no destino
-//   reg[02] = N  = número de registos
-//   reg[03 … 03+N-1] = valores a escrever
+// reg[00] = endereço destino
+// reg[01] = start index para escrever no destino
+// reg[02] = N (número de registos)
+// reg[03 … 03+N-1] = valores a escrever
 static void _do_auto() {
     if (sweep_get_count() == 0) {
-        Serial.println("[AUTO] Sem nós na tabela. Faz o sweep primeiro (opção 5)!");
+        Serial.println("[AUTO] Sem nós. Faz o sweep primeiro (opção 5)!");
         return;
     }
 
     sweep_print_table();
     uint8_t src_addr = _ask_byte("Endereço da torre FONTE (dec): ");
 
-    // ── 1. Ler cabeçalho (regs 0..2) ─────────────────────────
-    Serial.println("[AUTO] A ler header (regs 0..2) da torre fonte...");
+    // 1. ler header
+    Serial.println("[AUTO] A ler header (regs 0..2)...");
     uint8_t header[3];
     if (!_remote_read(src_addr, 0, 3, header)) {
         Serial.println("[AUTO] Falhou leitura do header!");
         return;
     }
-    uint8_t dest_addr  = header[0];
+    uint8_t dest_addr   = header[0];
     uint8_t write_start = header[1];
     uint8_t count       = header[2];
 
-    Serial.print("[AUTO] destino=0x");  Serial.print(dest_addr, HEX);
-    Serial.print("  start=");           Serial.print(write_start);
-    Serial.print("  count=");           Serial.println(count);
+    Serial.print("[AUTO] destino=0x"); Serial.print(dest_addr, HEX);
+    Serial.print("  start=");          Serial.print(write_start);
+    Serial.print("  count=");          Serial.println(count);
 
-    if (count == 0 || count > 25) {
-        Serial.println("[AUTO] Count inválido!");
-        return;
-    }
+    if (count == 0 || count > 25) { Serial.println("[AUTO] Count inválido!"); return; }
 
-    // ── 2. Ler valores (regs 3 … 3+count-1) ──────────────────
-    Serial.println("[AUTO] A ler valores da torre fonte...");
+    // 2. ler valores
+    Serial.println("[AUTO] A ler valores (regs 3..3+N-1)...");
     uint8_t vals[25];
     if (!_remote_read(src_addr, 3, count, vals)) {
         Serial.println("[AUTO] Falhou leitura dos valores!");
@@ -296,13 +280,13 @@ static void _do_auto() {
     }
     Serial.println();
 
-    // ── 3. Escrever no destino ────────────────────────────────
-    Serial.print("[AUTO] A escrever na torre 0x");
+    // 3. escrever no destino
+    Serial.print("[AUTO] A escrever em 0x");
     Serial.print(dest_addr, HEX);
     Serial.println("...");
 
     bool ok = _remote_write(dest_addr, write_start, count, vals, true);
-    Serial.println(ok ? "[AUTO] ✓ Missão concluída!" : "[AUTO] ✗ Escrita falhou!");
+    Serial.println(ok ? "[AUTO] ✓ Concluído!" : "[AUTO] ✗ Escrita falhou!");
 }
 
 // ── public ────────────────────────────────────────────────────
@@ -319,18 +303,22 @@ void app_update() {
     if (dl_receive(&f) == DL_OK)
         _process_frame(&f);
 
-    if (Serial.available()) {
-        char c = Serial.read();
-        switch (c) {
-            case '1': _do_ping();            break;
-            case '2': _do_write();           break;
-            case '3': _do_read();            break;
-            case '4': _do_show_regs();       break;
-            case '5': sweep_run();           break;
-            case '6': _do_auto();            break;
-            case '7': sweep_print_table();   break;
-            default: break;
-        }
-        _print_menu();
+    if (!Serial.available()) return;
+
+    char c = Serial.read();
+
+    // ignora \r e \n (Windows manda \r\n e causava double print)
+    if (c == '\r' || c == '\n') return;
+
+    switch (c) {
+        case '1': _do_ping();          break;
+        case '2': _do_write();         break;
+        case '3': _do_read();          break;
+        case '4': _do_show_regs();     break;
+        case '5': sweep_run();         break;
+        case '6': _do_auto();          break;
+        case '7': sweep_print_table(); break;
+        default: break;
     }
+    _print_menu();
 }

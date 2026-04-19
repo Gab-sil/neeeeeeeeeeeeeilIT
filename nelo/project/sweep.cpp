@@ -1,44 +1,63 @@
 #include "sweep.h"
-#include <Servo.h>
 
-// ── estado interno ────────────────────────────────────────────
-static Servo        _servo;
+// ── PWM de hardware para servo (50 Hz) ───────────────────────
+// 125 MHz / 64 (clkdiv) / 39063 (wrap) ≈ 50 Hz
+// 0°  = 1000 µs, 90° = 1500 µs, 180° = 2000 µs
+// count = us * (125_000_000 / 64) / 1_000_000 = us * 1.953f
+#define PWM_CLKDIV      64.0f
+#define PWM_WRAP        39062
+#define US_TO_COUNT(us) ((uint16_t)((us) * 1.953f))
+
+static uint8_t      _tx_slice;
 static sweep_node_t _nodes[SWEEP_MAX_NODES];
-static uint8_t      _node_count  = 0;
-static int          _cur_angle   = 90;
+static uint8_t      _node_count = 0;
+static int          _cur_angle  = 90;
 
 // ── helpers privados ──────────────────────────────────────────
+static uint16_t _angle_to_us(int angle) {
+    return (uint16_t)(1000 + (angle * 1000) / 180);
+}
+
 static void _point_to(int angle) {
-    _servo.write(angle);
+    if (angle < 0)   angle = 0;
+    if (angle > 180) angle = 180;
+    pwm_set_gpio_level(SERVO_PIN, US_TO_COUNT(_angle_to_us(angle)));
     _cur_angle = angle;
     delay(SWEEP_SETTLE_MS);
 }
 
-// Drena a fila de RX sem bloquear (descarta tudo).
-// Útil antes de enviar, para não processar pacotes velhos.
 static void _flush_rx() {
     ir_frame_t dummy;
     while (dl_receive(&dummy) == DL_OK);
 }
 
+static bool _is_known(uint8_t addr) {
+    for (uint8_t i = 0; i < _node_count; i++)
+        if (_nodes[i].address == addr) return true;
+    return false;
+}
+
 // ── public ────────────────────────────────────────────────────
 void sweep_init() {
-    _servo.attach(SERVO_PIN);
+    gpio_set_function(SERVO_PIN, GPIO_FUNC_PWM);
+    _tx_slice = pwm_gpio_to_slice_num(SERVO_PIN);
+    pwm_set_clkdiv(_tx_slice, PWM_CLKDIV);
+    pwm_set_wrap(_tx_slice, PWM_WRAP);
+    pwm_set_gpio_level(SERVO_PIN, US_TO_COUNT(1500));
+    pwm_set_enabled(_tx_slice, true);
     _point_to(90);
     Serial.println("[SWEEP] Servo inicializado em 90°");
 }
 
 void sweep_run() {
     _node_count = 0;
-
-    Serial.println("\n[SWEEP] === Início do sweep ===");
-    Serial.println("[SWEEP] 0° ──────────────────────── 180°");
+    Serial.println("\n[SWEEP] === Início do sweep 0°→180° ===");
 
     for (int angle = 0; angle <= 180; angle += SWEEP_STEP_DEG) {
         _point_to(angle);
         _flush_rx();
 
-        // ── broadcast PING ────────────────────────────────────
+        // broadcast PING
         ir_frame_t f;
         f.address = DL_BROADCAST;
         f.control = CMD_PING;
@@ -49,38 +68,28 @@ void sweep_run() {
         if (angle < 100) Serial.print(" ");
         if (angle < 10)  Serial.print(" ");
         Serial.print(angle);
-        Serial.print("° |");
+        Serial.print("°");
 
-        // ── coleta PONGs ──────────────────────────────────────
+        // coleta PONGs durante a janela
         uint32_t deadline = millis() + SWEEP_PONG_WAIT_MS;
         while (millis() < deadline) {
             phy_update();
             ir_frame_t resp;
-            if (dl_receive(&resp) != DL_OK) continue;
+            if (dl_receive(&resp) != DL_OK)        continue;
             if ((resp.control & 0x7F) != CMD_PONG) continue;
+            if (_is_known(resp.source))             continue;
+            if (_node_count >= SWEEP_MAX_NODES)     continue;
 
-            // Ignorar duplicados (mesmo nó já encontrado)
-            bool known = false;
-            for (uint8_t i = 0; i < _node_count; i++) {
-                if (_nodes[i].address == resp.source) { known = true; break; }
-            }
-            if (!known && _node_count < SWEEP_MAX_NODES) {
-                _nodes[_node_count].address = resp.source;
-                _nodes[_node_count].angle   = (uint8_t)angle;
-                _node_count++;
-                Serial.print(" NÓ 0x");
-                Serial.print(resp.source, HEX);
-                Serial.print(" @");
-                Serial.print(angle);
-                Serial.print("°");
-            }
+            _nodes[_node_count].address = resp.source;
+            _nodes[_node_count].angle   = (uint8_t)angle;
+            _node_count++;
+            Serial.print(" | NÓ 0x");
+            Serial.print(resp.source, HEX);
         }
         Serial.println();
     }
 
-    // Parqueia servo no centro
     _point_to(90);
-
     Serial.println("[SWEEP] === Sweep concluído ===");
     sweep_print_table();
 }
@@ -88,7 +97,7 @@ void sweep_run() {
 void sweep_point(uint8_t address) {
     for (uint8_t i = 0; i < _node_count; i++) {
         if (_nodes[i].address == address) {
-            Serial.print("[SWEEP] Apontar servo → 0x");
+            Serial.print("[SWEEP] → 0x");
             Serial.print(address, HEX);
             Serial.print(" (");
             Serial.print(_nodes[i].angle);
@@ -99,19 +108,22 @@ void sweep_point(uint8_t address) {
     }
     Serial.print("[SWEEP] AVISO: 0x");
     Serial.print(address, HEX);
-    Serial.println(" não está na tabela de nós!");
+    Serial.println(" não está na tabela!");
 }
 
-uint8_t sweep_get_count() { return _node_count; }
+void sweep_point_angle(int angle) {
+    _point_to(angle);
+    Serial.print("[SWEEP] → ");
+    Serial.print(angle);
+    Serial.println("°");
+}
 
+uint8_t       sweep_get_count() { return _node_count; }
 sweep_node_t* sweep_get_nodes() { return _nodes; }
 
 void sweep_print_table() {
     Serial.println("[SWEEP] Tabela de nós:");
-    if (_node_count == 0) {
-        Serial.println("  (nenhum nó descoberto)");
-        return;
-    }
+    if (_node_count == 0) { Serial.println("  (vazia)"); return; }
     for (uint8_t i = 0; i < _node_count; i++) {
         Serial.print("  [");
         Serial.print(i);
