@@ -84,6 +84,7 @@ static void _print_menu() {
     Serial.println("5 - SWEEP (descobrir nós)");
     Serial.println("6 - AUTO (fonte → destino)");
     Serial.println("7 - Ver tabela de nós");
+    Serial.println("8 - Configurar range de endereços");
     Serial.println("============");
 }
 
@@ -289,6 +290,17 @@ static void _do_auto() {
     Serial.println(ok ? "[AUTO] ✓ Concluído!" : "[AUTO] ✗ Escrita falhou!");
 }
 
+// ── configurar range de endereços ────────────────────────────
+static void _do_set_range() {
+    uint8_t addr_min = _ask_byte("Endereço mínimo (dec): ");
+    uint8_t addr_max = _ask_byte("Endereço máximo (dec): ");
+    if (addr_min > addr_max) {
+        Serial.println("[APP] Erro: mínimo > máximo!");
+        return;
+    }
+    sweep_set_range(addr_min, addr_max);
+}
+
 // ── public ────────────────────────────────────────────────────
 void app_init() {
     dl_init();
@@ -318,6 +330,7 @@ void app_update() {
         case '5': sweep_run();         break;
         case '6': _do_auto();          break;
         case '7': sweep_print_table(); break;
+        case '8': _do_set_range();     break;
         default: break;
     }
     _print_menu();

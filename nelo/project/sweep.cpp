@@ -2,8 +2,8 @@
 
 // ── PWM de hardware para servo (50 Hz) ───────────────────────
 // 125 MHz / 64 (clkdiv) / 39063 (wrap) ≈ 50 Hz
-// 0°  = 1000 µs, 90° = 1500 µs, 180° = 2000 µs
-// count = us * (125_000_000 / 64) / 1_000_000 = us * 1.953f
+// 0° = 1000µs, 90° = 1500µs, 180° = 2000µs
+// count = us * 1.953f
 #define PWM_CLKDIV      64.0f
 #define PWM_WRAP        39062
 #define US_TO_COUNT(us) ((uint16_t)((us) * 1.953f))
@@ -12,6 +12,9 @@ static uint8_t      _tx_slice;
 static sweep_node_t _nodes[SWEEP_MAX_NODES];
 static uint8_t      _node_count = 0;
 static int          _cur_angle  = 90;
+
+static uint8_t _addr_min = SWEEP_ADDR_MIN_DEFAULT;
+static uint8_t _addr_max = SWEEP_ADDR_MAX_DEFAULT;
 
 // ── helpers privados ──────────────────────────────────────────
 static uint16_t _angle_to_us(int angle) {
@@ -49,20 +52,27 @@ void sweep_init() {
     Serial.println("[SWEEP] Servo inicializado em 90°");
 }
 
+void sweep_set_range(uint8_t addr_min, uint8_t addr_max) {
+    if (addr_min > addr_max) return;
+    _addr_min = addr_min;
+    _addr_max = addr_max;
+    Serial.print("[SWEEP] Range configurado: 0x");
+    Serial.print(addr_min, HEX);
+    Serial.print(" → 0x");
+    Serial.println(addr_max, HEX);
+}
+
 void sweep_run() {
     _node_count = 0;
-    Serial.println("\n[SWEEP] === Início do sweep 0°→180° ===");
+    Serial.print("\n[SWEEP] === Sweep 0°→180° | endereços 0x");
+    Serial.print(_addr_min, HEX);
+    Serial.print("→0x");
+    Serial.print(_addr_max, HEX);
+    Serial.println(" ===");
 
     for (int angle = 0; angle <= 180; angle += SWEEP_STEP_DEG) {
         _point_to(angle);
         _flush_rx();
-
-        // broadcast PING
-        ir_frame_t f;
-        f.address = DL_BROADCAST;
-        f.control = CMD_PING;
-        f.len     = 0;
-        dl_send(&f);
 
         Serial.print("[SWEEP] ");
         if (angle < 100) Serial.print(" ");
@@ -70,21 +80,33 @@ void sweep_run() {
         Serial.print(angle);
         Serial.print("°");
 
-        // coleta PONGs durante a janela
-        uint32_t deadline = millis() + SWEEP_PONG_WAIT_MS;
-        while (millis() < deadline) {
-            phy_update();
-            ir_frame_t resp;
-            if (dl_receive(&resp) != DL_OK)        continue;
-            if ((resp.control & 0x7F) != CMD_PONG) continue;
-            if (_is_known(resp.source))             continue;
-            if (_node_count >= SWEEP_MAX_NODES)     continue;
+        // PING a cada endereço do range
+        for (uint8_t addr = _addr_min; addr <= _addr_max; addr++) {
+            if (_is_known(addr)) continue; // já encontrado, não volta a testar
 
-            _nodes[_node_count].address = resp.source;
-            _nodes[_node_count].angle   = (uint8_t)angle;
-            _node_count++;
-            Serial.print(" | NÓ 0x");
-            Serial.print(resp.source, HEX);
+            ir_frame_t f;
+            f.address = addr;
+            f.control = CMD_PING;
+            f.len     = 0;
+            dl_send(&f);
+
+            // espera PONG deste endereço específico
+            uint32_t deadline = millis() + SWEEP_PONG_WAIT_MS;
+            while (millis() < deadline) {
+                phy_update();
+                ir_frame_t resp;
+                if (dl_receive(&resp) != DL_OK)        continue;
+                if ((resp.control & 0x7F) != CMD_PONG) continue;
+                if (resp.source != addr)               continue;
+                if (_node_count >= SWEEP_MAX_NODES)    break;
+
+                _nodes[_node_count].address = addr;
+                _nodes[_node_count].angle   = (uint8_t)angle;
+                _node_count++;
+                Serial.print(" | NÓ 0x");
+                Serial.print(addr, HEX);
+                break; // PONG recebido, passa ao próximo endereço
+            }
         }
         Serial.println();
     }
